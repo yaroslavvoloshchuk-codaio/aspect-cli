@@ -96,10 +96,10 @@ jobs:
           command: .aspect/bootstrap.sh
       - run:
           name: Gazelle Task (ASPECT_DEBUG=1)
-          command: ASPECT_DEBUG=1 aspect gazelle --task-key gazelle-cci-debug
+          command: ASPECT_DEBUG=1 aspect gazelle --check --task-key gazelle-cci-debug
       - run:
           name: Gazelle Task
-          command: aspect gazelle --task-key gazelle-cci
+          command: aspect gazelle --check --task-key gazelle-cci
 
   delivery-task:
     machine: true

@@ -96,9 +96,9 @@ jobs:
       - name: Bootstrap
         run: .aspect/bootstrap.sh
       - name: Gazelle Task (ASPECT_DEBUG=1)
-        run: ASPECT_DEBUG=1 aspect gazelle --task-key gazelle-gha-debug
+        run: ASPECT_DEBUG=1 aspect gazelle --check --task-key gazelle-gha-debug
       - name: Gazelle Task
-        run: aspect gazelle --task-key gazelle-gha
+        run: aspect gazelle --check --task-key gazelle-gha
 
   delivery-task:
     runs-on: [self-hosted, aspect-workflows, aspect-default]

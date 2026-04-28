@@ -69,8 +69,8 @@ gazelle-task:
     - aspect-default
   script:
     - .aspect/bootstrap.sh
-    - ASPECT_DEBUG=1 aspect gazelle --task-key gazelle-gl-debug
-    - aspect gazelle --task-key gazelle-gl
+    - ASPECT_DEBUG=1 aspect gazelle --check --task-key gazelle-gl-debug
+    - aspect gazelle --check --task-key gazelle-gl
 
 delivery-task:
   stage: CI

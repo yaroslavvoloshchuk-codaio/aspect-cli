@@ -1,112 +1,84 @@
 """Define the 'gazelle' task
 
-`aspect gazelle` runs a gazelle target that updates BUILD files, then
-checks whether anything changed. Mirrors the `aspect format` flow:
+`aspect gazelle` runs an `aspect_gazelle()` target in `-mode=diff`
+to derive the verdict (was anything out of date) and the patch
+(unified diff on stdout) without modifying the tree, then optionally
+runs the same target in default fix-mode to apply the changes.
 
-  1. Snapshot the tracked working-tree state via `git stash create`.
-  2. Build and run the gazelle target (default `//tools/gazelle:gazelle`).
-  3. Diff the post-gazelle tree against the snapshot. A non-empty diff
-     means BUILD files were updated → task fails.
-  4. `--soft-fail` downgrades the failure to a WARNING (exit 0).
+Why not git stash + git diff (the original implementation):
+  - tree-state-dependent (no-HEAD repos required degraded handling)
+  - failed to detect new untracked BUILD files until we added a
+    separate `git ls-files --others` check
+  - mid-run interruption could leave the tree dirty
+  - relied on the formatter binary's exit code as a separate fact
+    from "did anything change"
 
-Unlike format, gazelle has no notion of "changed files" — it always
-walks the whole repo (subject to its own `# gazelle:exclude` directives
-in BUILD files). The task does not pass file lists to the gazelle
-binary; the gazelle target itself knows what to scan.
+Why not require a `with_check = True` sibling `.check` target:
+  - the standard gazelle wrapper hardcodes `-mode fix`, but Gazelle's
+    Go flag parsing treats `-mode=diff` passed after `--` as a
+    last-wins override — behavior switches to diff-mode (no tree
+    modification, diff on stdout) without rebuilding the binary.
+  - exit code is unreliable in that duplicate-flag config (it's 0
+    even when the diff is non-empty), so we drive the verdict off
+    stdout content instead. Robust and one fewer config knob for the
+    user.
 
 Install:
     Add aspect_gazelle_prebuilt to MODULE.bazel:
 
         bazel_dep(name = "aspect_gazelle_prebuilt", version = "0.0.8")
 
-    Define a gazelle target in `//tools/gazelle:BUILD`:
+    Define a gazelle target — `with_check` is NOT required:
 
         load("@aspect_gazelle_prebuilt//:def.bzl", "aspect_gazelle")
 
         aspect_gazelle(
             name = "gazelle",
-            languages = ["go", "proto", "python"],  # whatever fits the repo
+            languages = ["go", "proto", "python"],  # whatever fits
         )
 
 Usage:
-    # Run gazelle, fail if BUILD files were updated.
+    # Run gazelle, apply changes, fail if anything changed.
     aspect gazelle
+    # CI mode: don't modify the tree, just report.
+    aspect gazelle --check
     # Soft-fail mode — print a WARNING but exit 0.
     aspect gazelle --soft-fail
-    # Override the gazelle target.
-    aspect gazelle --gazelle-target=//path/to:my_gazelle
 """
 
 load("./lib/runnable.axl", "runnable")
 load("./traits.axl", "BazelTrait")
 
 
-def _git_capture(ctx, *args):
-    """Run `git <args>` and return (stdout, exit_code, stderr).
+def _parse_diff_paths(diff_text):
+    """Extract the set of affected paths from a unified diff.
 
-    Mirrors the helper in format.axl. All stderr is captured so callers
-    can include it in a fail() message; stdout is returned as-is.
+    Looks at `+++` lines (the "after" file in each hunk header).
+    Format:
+
+        +++ path/to/file.bazel\\t<timestamp>
+
+    For new files the corresponding `---` line is `--- /dev/null`,
+    which we don't need — the `+++` side is always the path that
+    would exist post-fix.
+
+    Returns a sorted list of unique paths. Empty list if the diff
+    is unparseable; callers fall back to printing the raw diff in
+    that case so the user still has something to act on.
     """
-    result = ctx.std.process.command("git").args(list(args)) \
-        .current_dir(ctx.std.env.current_dir()) \
-        .stdout("piped").stderr("piped").spawn().wait_with_output()
-    return result.stdout, result.status.code, result.stderr
-
-
-def _snapshot_tracked_state(ctx):
-    """Snapshot the current tracked-tree state via `git stash create`.
-
-    Mirrors `format._snapshot_tracked_state` semantics:
-      - commit SHA on success
-      - "" when the working tree is clean (stash create returns nothing)
-      - None when there is no HEAD (fresh repo / not a git repo);
-        callers should skip the diff phase and emit a warning.
-
-    Non-destructive: writes a stash commit object without modifying the
-    working tree, index, or stash list. The unreferenced commit is
-    garbage-collected by `git gc` after the default ~2-week grace
-    period — no leak, no manual cleanup required.
-    """
-    _, head_code, _ = _git_capture(ctx, "rev-parse", "--verify", "HEAD")
-    if head_code != 0:
-        return None
-    out, code, err = _git_capture(ctx, "stash", "create")
-    if code != 0:
-        msg = "`git stash create` failed (exit %d).\nstderr: %s\nThe gazelle task uses this to snapshot pre-gazelle state for diff detection. Ensure the workspace is a git repo." % (code, err.strip())
-        fail(msg)
-    return out.strip()
-
-
-def _diff_against(ctx, base):
-    """Return the diff between `base` and the working tree as a string.
-    `base=""` falls back to `git diff HEAD`.
-
-    Note: `git diff` only reports tracked-file changes. New untracked
-    files (a common gazelle output — generating BUILD.bazel in a
-    directory that didn't have one) are NOT included here. Callers in
-    the gazelle task pair this with `_untracked_files` to detect both.
-    """
-    target = base if base else "HEAD"
-    out, code, err = _git_capture(ctx, "diff", target)
-    if code != 0:
-        msg = "`git diff %s` failed (exit %d).\nstderr: %s" % (target, code, err.strip())
-        fail(msg)
-    return out
-
-
-def _untracked_files(ctx):
-    """Return the list of untracked, non-gitignored files in the
-    workspace. Used to detect new files gazelle creates (e.g.
-    BUILD.bazel in a previously-unmanaged directory) — those don't
-    show up in `git diff` against the stash snapshot.
-
-    Empty list on git failure (rare; treated as "no untracked files"
-    rather than failing the task here).
-    """
-    out, code, _ = _git_capture(ctx, "ls-files", "--others", "--exclude-standard")
-    if code != 0:
-        return []
-    return [f for f in out.strip().split("\n") if f]
+    paths = {}
+    for line in diff_text.split("\n"):
+        if not line.startswith("+++ "):
+            continue
+        rest = line[len("+++ "):]
+        # Strip the trailing tab + timestamp if present.
+        tab_idx = rest.find("\t")
+        path = rest[:tab_idx] if tab_idx >= 0 else rest
+        path = path.strip()
+        if not path or path == "/dev/null":
+            continue
+        paths[path] = True
+    return sorted(paths.keys())
 
 
 # buildifier: disable=function-docstring
@@ -123,8 +95,7 @@ def _impl(ctx: TaskContext) -> int:
     flags.extend(ctx.args.bazel_flag)
     flags.extend(bazel_trait.extra_flags)
     # Task-time flag contributors — features register hooks that need
-    # ctx.task (e.g. --build_metadata=ASPECT_TASK_NAME=...) which features
-    # can't produce at activation time because FeatureContext has no task.
+    # ctx.task (e.g. --build_metadata=ASPECT_TASK_NAME=...).
     for hook in bazel_trait.task_flags:
         flags.extend(hook(ctx))
     if bazel_trait.flags:
@@ -154,66 +125,51 @@ def _impl(ctx: TaskContext) -> int:
     if not gazelle:
         fail("Failed to determine the gazelle target's entrypoint.")
 
-    # Snapshot pre-gazelle tracked state AND the existing untracked-file
-    # set. We need both because gazelle can:
-    #   - modify tracked BUILD files (caught by `git diff <stash>`)
-    #   - create new BUILD files in directories that didn't have one
-    #     (caught by comparing untracked-file sets pre vs post — git
-    #     diff against a stash commit ignores untracked content)
-    # Pre-existing untracked files (user's own dirty state, IDE
-    # detritus, etc.) are excluded by taking the post-pre delta —
-    # only files gazelle actually created get flagged.
-    pre_snap = _snapshot_tracked_state(ctx)
-    pre_untracked = {f: True for f in _untracked_files(ctx)}
+    # Diff phase: run with -mode=diff to get the verdict and the patch
+    # without modifying the tree. The standard aspect_gazelle wrapper
+    # hardcodes `-mode fix`; Gazelle's flag parser treats this second
+    # `-mode` as a last-wins override (BEHAVIOR switches to diff —
+    # tree is not modified, unified diff prints on stdout). Exit code
+    # is 0 in this duplicate-flag config even when the diff is
+    # non-empty, so we drive the verdict off stdout content.
+    diff_proc = r.spawn(gazelle, ["-mode=diff"], capture = True)
+    diff_stdout = diff_proc.stdout().read_to_string()
+    diff_status = diff_proc.wait()
 
-    exit = r.spawn(gazelle, []).wait()
+    # Real gazelle errors (config issues, missing language, etc.)
+    # surface as non-zero exit + empty stdout — let the user see the
+    # gazelle stderr and the task's error code.
+    if not diff_status.success and not diff_stdout.strip():
+        out.write("\x1b[0;31mERROR\x1b[0m: gazelle (-mode=diff) exited %d with no diff output (likely a configuration error — see stderr above).\n" % diff_status.code)
+        return diff_status.code
 
-    if not exit.success:
-        # Gazelle itself errored — surface the exit code and skip the
-        # diff check. Whatever gazelle wrote to disk before erroring is
-        # left in place for the user to inspect.
-        out.write("\x1b[0;31mERROR\x1b[0m: gazelle exited with code %d\n" % exit.code)
-        return exit.code
-
-    # No HEAD — fresh repo or not a git repo. Gazelle ran but we can't
-    # compute a diff to know whether it changed anything. Degrade with
-    # a warning rather than failing.
-    if pre_snap == None:
-        out.write("\x1b[0;33mWARNING\x1b[0m: cannot resolve HEAD (no initial git commit, or not in a git repository); gazelle-required detection is skipped. Gazelle ran, but we cannot tell whether it changed anything.\n")
-        out.write("Make at least one commit (or run inside a git repo) and re-run if you want `aspect gazelle` to surface gazelle-induced changes.\n")
+    if not diff_stdout.strip():
+        # Clean — gazelle reports no changes needed. We're done
+        # regardless of --check / fix mode.
         return 0
 
-    # Tracked-file changes (modified, added-via-stage, deleted).
-    gazelle_diff = _diff_against(ctx, pre_snap)
-    modified = []
-    if gazelle_diff:
-        name_out, _, _ = _git_capture(ctx, "diff", "--name-only", pre_snap if pre_snap else "HEAD")
-        modified = [f for f in name_out.strip().split("\n") if f]
+    affected = _parse_diff_paths(diff_stdout)
 
-    # Newly untracked files — gazelle creating BUILD.bazel in a directory
-    # that didn't have one. Subtract pre_untracked so the user's own
-    # untracked content (local IDE files, scratch dirs, anything in
-    # `git status -uall` before the run) doesn't false-positive.
-    new_untracked = [f for f in _untracked_files(ctx) if f not in pre_untracked]
+    # Apply phase (default mode): re-run gazelle without the override
+    # so the wrapper's `-mode fix` takes effect and writes BUILDs.
+    # `--check` skips this — CI doesn't want a dirtied tree.
+    if not ctx.args.check:
+        fix_status = r.spawn(gazelle, []).wait()
+        if not fix_status.success:
+            out.write("\x1b[0;31mERROR\x1b[0m: gazelle (apply) exited with code %d\n" % fix_status.code)
+            return fix_status.code
 
-    if not modified and not new_untracked:
-        return 0
-
-    # Combine modified + new for the user-facing affected list. Mark
-    # newly-created files with "(new)" so the diagnostic distinguishes
-    # them from in-place rewrites. A file that's both modified AND in
-    # new_untracked shouldn't really happen (modified implies tracked),
-    # but if it does we treat it as modified.
-    affected_kind = {f: "modified" for f in modified}
-    for f in new_untracked:
-        if f not in affected_kind:
-            affected_kind[f] = "new"
-    affected = sorted(affected_kind.keys())
-
-    out.write("\nGazelle updated %d file(s):\n" % len(affected))
-    for f in affected:
-        marker = " (new)" if affected_kind[f] == "new" else ""
-        out.write("  - %s%s\n" % (f, marker))
+    verb = "would update" if ctx.args.check else "updated"
+    if affected:
+        out.write("\nGazelle %s %d file(s):\n" % (verb, len(affected)))
+        for f in affected:
+            out.write("  - %s\n" % f)
+    else:
+        # Diff was non-empty but `+++` lines didn't yield paths —
+        # fall back to printing the raw diff so the user has
+        # something to act on.
+        out.write("\nGazelle %s BUILD files (raw diff follows):\n" % verb)
+        out.write(diff_stdout)
 
     if ctx.args.soft_fail:
         out.write("\x1b[0;33mWARNING\x1b[0m: BUILD files are out of date, but --soft-fail is set; task exits 0.\n")
@@ -228,13 +184,17 @@ gazelle = task(
     implementation = _impl,
     traits = [BazelTrait],
     args = {
+        "check": args.boolean(
+            default = False,
+            description = "When true, only report the diff — don't apply it. Recommended in CI: faster (skips the apply step), leaves the tree clean (no risk of a half-formatted state on mid-run interrupt), and the verdict comes from gazelle directly without depending on the workspace being a git working tree. Local devs typically leave this off so `aspect gazelle` updates BUILD files in place.",
+        ),
         "soft_fail": args.boolean(
             default = False,
-            description = "When true, the task returns 0 even if gazelle updated BUILD files, printing a WARNING with the affected file list instead. Useful for teams introducing gazelle incrementally so the CI step doesn't block merges. Gazelle's own non-zero exits are still surfaced as task failures regardless of this flag.",
+            description = "When true, the task returns 0 even when BUILD files are out of date, printing a WARNING with the affected file list instead. Useful for teams introducing gazelle incrementally so the CI step doesn't block merges. Gazelle's own non-zero exits (configuration errors, missing language extensions, etc.) are still surfaced as task failures regardless of this flag.",
         ),
         "gazelle_target": args.string(
             default = "//tools/gazelle:gazelle",
-            description = "Bazel label of the gazelle target (typically generated by `aspect_gazelle()` from `@aspect_gazelle_prebuilt//:def.bzl`). The target is built first, then run with no positional arguments — gazelle scans the workspace itself, honoring `# gazelle:exclude` directives in BUILD files.",
+            description = "Bazel label of the gazelle target. Generated by `aspect_gazelle()` from `@aspect_gazelle_prebuilt//:def.bzl`. The task invokes the same target twice in fix mode (once with `-mode=diff` to derive the verdict + patch without modifying the tree, then again in default fix-mode to apply the changes) and just once in `--check` mode (the diff invocation only).",
         ),
         "bazel_flag": args.string_list(
             description = "Additional Bazel flags forwarded to the gazelle build. Repeat the flag to pass multiple — e.g. `--bazel-flag=--config=ci --bazel-flag=--keep_going`.",

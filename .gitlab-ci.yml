@@ -72,6 +72,20 @@ gazelle-task:
     - ASPECT_DEBUG=1 aspect gazelle --check --task-key gazelle-gl-debug
     - aspect gazelle --check --task-key gazelle-gl
 
+# Regression test for the build-from-source gazelle path — upstream
+# `gazelle()` macro + rules_go toolchain. Most users will adopt the
+# prebuilt binary; this job catches breakage on the alternate path.
+gazelle-from-source-task:
+  stage: CI
+  needs: [pre-build]
+  tags:
+    - aspect-workflows
+    - aspect-default
+  script:
+    - .aspect/bootstrap.sh
+    - ASPECT_DEBUG=1 aspect gazelle --check --gazelle-target=//tools/gazelle:gazelle_from_source --task-key gazelle-from-source-gl-debug
+    - aspect gazelle --check --gazelle-target=//tools/gazelle:gazelle_from_source --task-key gazelle-from-source-gl
+
 delivery-task:
   stage: CI
   needs: [pre-build]

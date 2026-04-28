@@ -125,6 +125,18 @@ def _impl(ctx: TaskContext) -> int:
     if not gazelle:
         fail("Failed to determine the gazelle target's entrypoint.")
 
+    # Upstream `gazelle()` (bazel-gazelle, used by `gazelle_from_source`-
+    # style targets) produces both a `<name>` sh_binary and an inner
+    # `<name>-runner.bash` script — and `determine_entrypoint` may
+    # surface either depending on BES ordering. The inner runner
+    # script's `$0`-relative runfiles lookup expects to find a sibling
+    # `<name>-runner.bash.runfiles` dir, but bazel actually creates
+    # the runfiles tree as `<name>.runfiles` (matching the sh_binary).
+    # Stripping the suffix points us at the sh_binary symlink instead,
+    # whose runfiles dir resolves correctly.
+    if gazelle.endswith("-runner.bash"):
+        gazelle = gazelle[:-len("-runner.bash")]
+
     # Diff phase: run with -mode=diff to get the verdict and the patch
     # without modifying the tree. The standard aspect_gazelle wrapper
     # hardcodes `-mode fix`; Gazelle's flag parser treats this second

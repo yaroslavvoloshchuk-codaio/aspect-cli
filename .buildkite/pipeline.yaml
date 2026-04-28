@@ -180,6 +180,26 @@ steps:
       ASPECT_DEBUG=1 aspect gazelle --check --task-key gazelle-bk-debug
       aspect gazelle --check --task-key gazelle-bk
 
+  - key: gazelle-from-source-task
+    label: ":aspect: Gazelle Task (from-source)"
+    depends_on:
+      - pre-build
+    agents:
+      queue: aspect-default
+    timeout_in_minutes: 30
+    retry:
+      automatic:
+        - exit_status: 78 # unhealthy signal from .buildkite/hooks/pre-command
+          limit: 1
+    command: |
+      # Regression test for the build-from-source gazelle path
+      # (upstream `gazelle()` macro + rules_go toolchain) — same task
+      # logic, alternate target. Most users will adopt the prebuilt
+      # binary; this job exists so we catch breakage in the
+      # build-from-source path.
+      ASPECT_DEBUG=1 aspect gazelle --check --gazelle-target=//tools/gazelle:gazelle_from_source --task-key gazelle-from-source-bk-debug
+      aspect gazelle --check --gazelle-target=//tools/gazelle:gazelle_from_source --task-key gazelle-from-source-bk
+
   - key: build-task
     depends_on:
       - pre-build

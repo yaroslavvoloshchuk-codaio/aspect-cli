@@ -5,13 +5,11 @@ to derive the verdict (was anything out of date) and the patch
 (unified diff on stdout) without modifying the tree, then optionally
 runs the same target in default fix-mode to apply the changes.
 
-Why not git stash + git diff (the original implementation):
-  - tree-state-dependent (no-HEAD repos required degraded handling)
-  - failed to detect new untracked BUILD files until we added a
+Why not git stash + git diff (the format task):
+  - we can rely on -mode=diff with gazelle where we can't rely
+    on that with formatters
+  - more complex to detect new untracked BUILD files using a
     separate `git ls-files --others` check
-  - mid-run interruption could leave the tree dirty
-  - relied on the formatter binary's exit code as a separate fact
-    from "did anything change"
 
 Why not require a `with_check = True` sibling `.check` target:
   - the standard gazelle wrapper hardcodes `-mode fix`, but Gazelle's

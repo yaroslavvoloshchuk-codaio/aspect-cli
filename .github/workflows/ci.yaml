@@ -112,10 +112,12 @@ jobs:
       # Regression test for the build-from-source gazelle path —
       # upstream `gazelle()` macro + rules_go toolchain compiling a
       # bespoke gazelle binary, instead of the prebuilt artifact.
+      # `--config=pure_go` is required on Linux: toolchains_llvm_bootstrapped's
+      # lld can't accept Go's non-PIC relocations on x86_64.
       - name: Gazelle Task — from-source (ASPECT_DEBUG=1)
-        run: ASPECT_DEBUG=1 aspect gazelle --check --gazelle-target=//tools/gazelle:gazelle_from_source --task-key gazelle-from-source-gha-debug
+        run: ASPECT_DEBUG=1 aspect gazelle --check --gazelle-target=//tools/gazelle:gazelle_from_source --bazel-flag=--config=pure_go --task-key gazelle-from-source-gha-debug
       - name: Gazelle Task — from-source
-        run: aspect gazelle --check --gazelle-target=//tools/gazelle:gazelle_from_source --task-key gazelle-from-source-gha
+        run: aspect gazelle --check --gazelle-target=//tools/gazelle:gazelle_from_source --bazel-flag=--config=pure_go --task-key gazelle-from-source-gha
 
   delivery-task:
     runs-on: [self-hosted, aspect-workflows, aspect-default]

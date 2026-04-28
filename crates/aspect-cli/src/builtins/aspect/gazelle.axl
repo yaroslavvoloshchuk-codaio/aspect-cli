@@ -1,38 +1,61 @@
 """Define the 'gazelle' task
 
-`aspect gazelle` runs an `aspect_gazelle()` target in `-mode=diff`
-to derive the verdict (was anything out of date) and the patch
-(unified diff on stdout) without modifying the tree, then optionally
-runs the same target in default fix-mode to apply the changes.
+`aspect gazelle` runs a single gazelle target with `-mode=diff` to
+get the verdict (was anything out of date) and the patch (unified
+diff on stdout) without modifying the tree. In fix mode (default)
+the captured patch is then applied via `git apply -p0` — there's no
+second gazelle invocation, which matters on large monorepos where
+gazelle's whole-repo scan is the slow part.
+
+Flow:
+    1. Build the gazelle target.
+    2. Run it with `-mode=diff`, capture stdout. The wrapper
+       hardcodes `-mode fix`; Gazelle's Go flag parser treats the
+       second `-mode` as a last-wins override (BEHAVIOR switches
+       to diff-mode — no tree modification, unified diff on
+       stdout). Exit code is unreliable in this duplicate-flag
+       config (it's 0 even on diff), so the verdict comes from
+       stdout content, not exit code.
+    3. If stdout is empty → exit 0 (clean).
+    4. If stdout has a diff:
+         - In `--check` mode: report the affected files and exit 1.
+         - In fix mode (default): `git apply -p0 <diff>` to write
+           the changes, report the affected files, exit 1. The
+           non-zero exit signals "BUILDs were out of date — please
+           commit the working-tree changes" (matches format's
+           contract).
+    5. With `--upload-gazelle-diff` set on a recognized CI host,
+       the captured patch is also uploaded as `gazelle.patch` so
+       reviewers can apply it locally.
+
+Why a single target (rather than a `with_check = True` sibling
+`.check` target):
+  - `with_check` is specific to `aspect_gazelle()` from
+    `aspect_gazelle_prebuilt`. Upstream `gazelle()` from
+    `bazel-contrib/bazel-gazelle` (used when building gazelle from
+    source via `bazel_dep(name = "gazelle")` + rules_go) has no
+    equivalent — it only emits `<name>` and `<name>-runner.bash`.
+    The `-mode=diff` runtime override works against both, so the
+    same task implementation drives prebuilt and from-source
+    targets. We exercise the from-source path via the
+    `:gazelle_from_source` regression target in CI.
 
 Why not git stash + git diff (the format task):
-  - we can rely on -mode=diff with gazelle where we can't rely
-    on that with formatters
-  - more complex to detect new untracked BUILD files using a
-    separate `git ls-files --others` check
-
-Why not require a `with_check = True` sibling `.check` target:
-  - `with_check` is specific to `aspect_gazelle()` from
-    `aspect_gazelle_prebuilt`. Upstream `gazelle()` (the
-    `bazel-contrib/bazel-gazelle` macro that users adopt when
-    building gazelle from source) has no equivalent — it only
-    emits `<name>` and `<name>-runner.bash`. So requiring `.check`
-    would lock the task to the prebuilt module and break the
-    build-from-source path (which we exercise via the
-    `:gazelle_from_source` regression target).
-  - The aspect-gazelle-prebuilt wrapper hardcodes `-mode fix`,
-    but Gazelle's Go flag parsing treats `-mode=diff` passed after
-    `--` as a last-wins override — BEHAVIOR switches to diff-mode
-    (no tree modification, diff on stdout) without rebuilding the
-    binary. Same trick applies to upstream gazelle, so the same
-    task implementation works against either.
+  - We can rely on gazelle's own `-mode=diff` to produce a clean
+    unified diff. Formatters mostly can't — see format.axl's
+    docstring for that story.
+  - Detecting newly-created BUILD files (a common gazelle output)
+    via `git diff` is awkward — that's tracked-file-only, so we'd
+    need a separate `git ls-files --others` snapshot. The diff
+    from `-mode=diff` includes new files natively
+    (`--- /dev/null +++ <new path>`).
 
 Install:
-    Add aspect_gazelle_prebuilt to MODULE.bazel:
+    Add `aspect_gazelle_prebuilt` to MODULE.bazel:
 
         bazel_dep(name = "aspect_gazelle_prebuilt", version = "0.0.8")
 
-    Define a gazelle target — `with_check` is NOT required:
+    Define a gazelle target. `with_check` is NOT required:
 
         load("@aspect_gazelle_prebuilt//:def.bzl", "aspect_gazelle")
 
@@ -42,10 +65,22 @@ Install:
         )
 
 Usage:
-    # Run gazelle, apply changes, fail if anything changed.
+    # Run gazelle, apply changes via `git apply -p0`,
+    # exit 1 if anything changed.
     aspect gazelle
-    # CI mode: don't modify the tree, just report.
+
+    # CI mode: don't modify the tree, just report and exit 1 on diff.
     aspect gazelle --check
+
+    # CI patch upload: archives the diff as a `gazelle.patch` artifact.
+    aspect gazelle --check --upload-gazelle-diff
+
+    # Override the gazelle target (e.g. build-from-source variant).
+    # Combine with `--bazel-flag=--config=pure_go` if linking against
+    # toolchains_llvm_bootstrapped on Linux.
+    aspect gazelle --check \\
+        --gazelle-target=//tools/gazelle:gazelle_from_source \\
+        --bazel-flag=--config=pure_go
 """
 
 load("./lib/artifacts.axl", "artifact_name", "create_uploader", "detect_ci")

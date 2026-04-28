@@ -1,0 +1,200 @@
+"""Define the 'gazelle' task
+
+`aspect gazelle` runs a gazelle target that updates BUILD files, then
+checks whether anything changed. Mirrors the `aspect format` flow:
+
+  1. Snapshot the tracked working-tree state via `git stash create`.
+  2. Build and run the gazelle target (default `//tools/gazelle:gazelle`).
+  3. Diff the post-gazelle tree against the snapshot. A non-empty diff
+     means BUILD files were updated → task fails.
+  4. `--soft-fail` downgrades the failure to a WARNING (exit 0).
+
+Unlike format, gazelle has no notion of "changed files" — it always
+walks the whole repo (subject to its own `# gazelle:exclude` directives
+in BUILD files). The task does not pass file lists to the gazelle
+binary; the gazelle target itself knows what to scan.
+
+Install:
+    Add aspect_gazelle_prebuilt to MODULE.bazel:
+
+        bazel_dep(name = "aspect_gazelle_prebuilt", version = "0.0.8")
+
+    Define a gazelle target in `//tools/gazelle:BUILD`:
+
+        load("@aspect_gazelle_prebuilt//:def.bzl", "aspect_gazelle")
+
+        aspect_gazelle(
+            name = "gazelle",
+            languages = ["go", "proto", "python"],  # whatever fits the repo
+        )
+
+Usage:
+    # Run gazelle, fail if BUILD files were updated.
+    aspect gazelle
+    # Soft-fail mode — print a WARNING but exit 0.
+    aspect gazelle --soft-fail
+    # Override the gazelle target.
+    aspect gazelle --gazelle-target=//path/to:my_gazelle
+"""
+
+load("./lib/runnable.axl", "runnable")
+load("./traits.axl", "BazelTrait")
+
+
+def _git_capture(ctx, *args):
+    """Run `git <args>` and return (stdout, exit_code, stderr).
+
+    Mirrors the helper in format.axl. All stderr is captured so callers
+    can include it in a fail() message; stdout is returned as-is.
+    """
+    result = ctx.std.process.command("git").args(list(args)) \
+        .current_dir(ctx.std.env.current_dir()) \
+        .stdout("piped").stderr("piped").spawn().wait_with_output()
+    return result.stdout, result.status.code, result.stderr
+
+
+def _snapshot_tracked_state(ctx):
+    """Snapshot the current tracked-tree state via `git stash create`.
+
+    Mirrors `format._snapshot_tracked_state` semantics:
+      - commit SHA on success
+      - "" when the working tree is clean (stash create returns nothing)
+      - None when there is no HEAD (fresh repo / not a git repo);
+        callers should skip the diff phase and emit a warning.
+
+    Non-destructive: writes a stash commit object without modifying the
+    working tree, index, or stash list. The unreferenced commit is
+    garbage-collected by `git gc` after the default ~2-week grace
+    period — no leak, no manual cleanup required.
+    """
+    _, head_code, _ = _git_capture(ctx, "rev-parse", "--verify", "HEAD")
+    if head_code != 0:
+        return None
+    out, code, err = _git_capture(ctx, "stash", "create")
+    if code != 0:
+        msg = "`git stash create` failed (exit %d).\nstderr: %s\nThe gazelle task uses this to snapshot pre-gazelle state for diff detection. Ensure the workspace is a git repo." % (code, err.strip())
+        fail(msg)
+    return out.strip()
+
+
+def _diff_against(ctx, base):
+    """Return the diff between `base` and the working tree as a string.
+    `base=""` falls back to `git diff HEAD`.
+    """
+    target = base if base else "HEAD"
+    out, code, err = _git_capture(ctx, "diff", target)
+    if code != 0:
+        msg = "`git diff %s` failed (exit %d).\nstderr: %s" % (target, code, err.strip())
+        fail(msg)
+    return out
+
+
+# buildifier: disable=function-docstring
+def _impl(ctx: TaskContext) -> int:
+    out = ctx.std.io.stdout
+    bazel_trait = ctx.traits[BazelTrait]
+    out.write("Building gazelle...\n")
+
+    flags = [
+        "--remote_download_outputs=toplevel",
+        "--build_runfile_links",
+        "--experimental_build_event_upload_strategy=local",
+        "--noallow_analysis_cache_discard",
+    ]
+    flags.extend(ctx.args.bazel_flag)
+    flags.extend(bazel_trait.extra_flags)
+    # Task-time flag contributors — features register hooks that need
+    # ctx.task (e.g. --build_metadata=ASPECT_TASK_NAME=...) which features
+    # can't produce at activation time because FeatureContext has no task.
+    for hook in bazel_trait.task_flags:
+        flags.extend(hook(ctx))
+    if bazel_trait.flags:
+        flags = bazel_trait.flags(flags)
+
+    startup_flags = list(ctx.args.bazel_startup_flag)
+    startup_flags.extend(bazel_trait.extra_startup_flags)
+    if bazel_trait.startup_flags:
+        startup_flags = bazel_trait.startup_flags(startup_flags)
+    ctx.bazel.startup_flags.extend(startup_flags)
+
+    r = runnable(ctx, [ctx.args.gazelle_target])
+
+    build = ctx.bazel.build(
+        ctx.args.gazelle_target,
+        build_events = True,
+        flags = flags,
+    )
+
+    for event in build.build_events():
+        r.event(event)
+
+    if not build.wait().success:
+        fail("Building the gazelle target has failed.")
+
+    gazelle = r.determine_entrypoint(ctx.args.gazelle_target)
+    if not gazelle:
+        fail("Failed to determine the gazelle target's entrypoint.")
+
+    # Snapshot pre-gazelle tracked state so we can detect what gazelle
+    # changed independently of any pre-existing dirty files.
+    pre_snap = _snapshot_tracked_state(ctx)
+
+    exit = r.spawn(gazelle, []).wait()
+
+    if not exit.success:
+        # Gazelle itself errored — surface the exit code and skip the
+        # diff check. Whatever gazelle wrote to disk before erroring is
+        # left in place for the user to inspect.
+        out.write("\x1b[0;31mERROR\x1b[0m: gazelle exited with code %d\n" % exit.code)
+        return exit.code
+
+    # No HEAD — fresh repo or not a git repo. Gazelle ran but we can't
+    # compute a diff to know whether it changed anything. Degrade with
+    # a warning rather than failing.
+    if pre_snap == None:
+        out.write("\x1b[0;33mWARNING\x1b[0m: cannot resolve HEAD (no initial git commit, or not in a git repository); gazelle-required detection is skipped. Gazelle ran, but we cannot tell whether it changed anything.\n")
+        out.write("Make at least one commit (or run inside a git repo) and re-run if you want `aspect gazelle` to surface gazelle-induced changes.\n")
+        return 0
+
+    # Diff the post-gazelle tree against the snapshot. Non-empty = gazelle
+    # updated BUILD files = "BUILD files out of date".
+    gazelle_diff = _diff_against(ctx, pre_snap)
+    if not gazelle_diff:
+        return 0
+
+    name_out, _, _ = _git_capture(ctx, "diff", "--name-only", pre_snap if pre_snap else "HEAD")
+    affected = [f for f in name_out.strip().split("\n") if f]
+
+    out.write("\nGazelle updated %d file(s):\n" % len(affected))
+    for f in affected:
+        out.write("  - %s\n" % f)
+
+    if ctx.args.soft_fail:
+        out.write("\x1b[0;33mWARNING\x1b[0m: BUILD files are out of date, but --soft-fail is set; task exits 0.\n")
+        out.write("Run `aspect gazelle` (or `bazel run %s`) locally and commit the result, or amend with --soft-fail=false to enforce.\n" % ctx.args.gazelle_target)
+        return 0
+
+    out.write("\x1b[0;31mERROR\x1b[0m: BUILD files are out of date. Run `aspect gazelle` locally and commit the result.\n")
+    return 1
+
+
+gazelle = task(
+    implementation = _impl,
+    traits = [BazelTrait],
+    args = {
+        "soft_fail": args.boolean(
+            default = False,
+            description = "When true, the task returns 0 even if gazelle updated BUILD files, printing a WARNING with the affected file list instead. Useful for teams introducing gazelle incrementally so the CI step doesn't block merges. Gazelle's own non-zero exits are still surfaced as task failures regardless of this flag.",
+        ),
+        "gazelle_target": args.string(
+            default = "//tools/gazelle:gazelle",
+            description = "Bazel label of the gazelle target (typically generated by `aspect_gazelle()` from `@aspect_gazelle_prebuilt//:def.bzl`). The target is built first, then run with no positional arguments — gazelle scans the workspace itself, honoring `# gazelle:exclude` directives in BUILD files.",
+        ),
+        "bazel_flag": args.string_list(
+            description = "Additional Bazel flags forwarded to the gazelle build. Repeat the flag to pass multiple — e.g. `--bazel-flag=--config=ci --bazel-flag=--keep_going`.",
+        ),
+        "bazel_startup_flag": args.string_list(
+            description = "Additional Bazel startup flags. Repeat the flag to pass multiple. Note: changing startup flags restarts the Bazel server.",
+        ),
+    },
+)

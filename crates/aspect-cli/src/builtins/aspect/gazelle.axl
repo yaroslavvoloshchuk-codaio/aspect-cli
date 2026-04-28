@@ -80,6 +80,11 @@ def _snapshot_tracked_state(ctx):
 def _diff_against(ctx, base):
     """Return the diff between `base` and the working tree as a string.
     `base=""` falls back to `git diff HEAD`.
+
+    Note: `git diff` only reports tracked-file changes. New untracked
+    files (a common gazelle output — generating BUILD.bazel in a
+    directory that didn't have one) are NOT included here. Callers in
+    the gazelle task pair this with `_untracked_files` to detect both.
     """
     target = base if base else "HEAD"
     out, code, err = _git_capture(ctx, "diff", target)
@@ -87,6 +92,21 @@ def _diff_against(ctx, base):
         msg = "`git diff %s` failed (exit %d).\nstderr: %s" % (target, code, err.strip())
         fail(msg)
     return out
+
+
+def _untracked_files(ctx):
+    """Return the list of untracked, non-gitignored files in the
+    workspace. Used to detect new files gazelle creates (e.g.
+    BUILD.bazel in a previously-unmanaged directory) — those don't
+    show up in `git diff` against the stash snapshot.
+
+    Empty list on git failure (rare; treated as "no untracked files"
+    rather than failing the task here).
+    """
+    out, code, _ = _git_capture(ctx, "ls-files", "--others", "--exclude-standard")
+    if code != 0:
+        return []
+    return [f for f in out.strip().split("\n") if f]
 
 
 # buildifier: disable=function-docstring
@@ -135,9 +155,17 @@ def _impl(ctx: TaskContext) -> int:
     if not gazelle:
         fail("Failed to determine the gazelle target's entrypoint.")
 
-    # Snapshot pre-gazelle tracked state so we can detect what gazelle
-    # changed independently of any pre-existing dirty files.
+    # Snapshot pre-gazelle tracked state AND the existing untracked-file
+    # set. We need both because gazelle can:
+    #   - modify tracked BUILD files (caught by `git diff <stash>`)
+    #   - create new BUILD files in directories that didn't have one
+    #     (caught by comparing untracked-file sets pre vs post — git
+    #     diff against a stash commit ignores untracked content)
+    # Pre-existing untracked files (user's own dirty state, IDE
+    # detritus, etc.) are excluded by taking the post-pre delta —
+    # only files gazelle actually created get flagged.
     pre_snap = _snapshot_tracked_state(ctx)
+    pre_untracked = {f: True for f in _untracked_files(ctx)}
 
     exit = r.spawn(gazelle, []).wait()
 
@@ -156,18 +184,37 @@ def _impl(ctx: TaskContext) -> int:
         out.write("Make at least one commit (or run inside a git repo) and re-run if you want `aspect gazelle` to surface gazelle-induced changes.\n")
         return 0
 
-    # Diff the post-gazelle tree against the snapshot. Non-empty = gazelle
-    # updated BUILD files = "BUILD files out of date".
+    # Tracked-file changes (modified, added-via-stage, deleted).
     gazelle_diff = _diff_against(ctx, pre_snap)
-    if not gazelle_diff:
+    modified = []
+    if gazelle_diff:
+        name_out, _, _ = _git_capture(ctx, "diff", "--name-only", pre_snap if pre_snap else "HEAD")
+        modified = [f for f in name_out.strip().split("\n") if f]
+
+    # Newly untracked files — gazelle creating BUILD.bazel in a directory
+    # that didn't have one. Subtract pre_untracked so the user's own
+    # untracked content (local IDE files, scratch dirs, anything in
+    # `git status -uall` before the run) doesn't false-positive.
+    new_untracked = [f for f in _untracked_files(ctx) if f not in pre_untracked]
+
+    if not modified and not new_untracked:
         return 0
 
-    name_out, _, _ = _git_capture(ctx, "diff", "--name-only", pre_snap if pre_snap else "HEAD")
-    affected = [f for f in name_out.strip().split("\n") if f]
+    # Combine modified + new for the user-facing affected list. Mark
+    # newly-created files with "(new)" so the diagnostic distinguishes
+    # them from in-place rewrites. A file that's both modified AND in
+    # new_untracked shouldn't really happen (modified implies tracked),
+    # but if it does we treat it as modified.
+    affected_kind = {f: "modified" for f in modified}
+    for f in new_untracked:
+        if f not in affected_kind:
+            affected_kind[f] = "new"
+    affected = sorted(affected_kind.keys())
 
     out.write("\nGazelle updated %d file(s):\n" % len(affected))
     for f in affected:
-        out.write("  - %s\n" % f)
+        marker = " (new)" if affected_kind[f] == "new" else ""
+        out.write("  - %s%s\n" % (f, marker))
 
     if ctx.args.soft_fail:
         out.write("\x1b[0;33mWARNING\x1b[0m: BUILD files are out of date, but --soft-fail is set; task exits 0.\n")

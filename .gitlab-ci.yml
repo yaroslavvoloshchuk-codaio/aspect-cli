@@ -59,10 +59,6 @@ format-task:
   script:
     - .aspect/bootstrap.sh
     - ASPECT_DEBUG=1 aspect format --task-key format-gl-debug
-    # Reset in-place formatter rewrites between runs so the non-debug
-    # invocation starts from the same pre-format state. format only
-    # modifies tracked files, so `reset --hard HEAD` is sufficient.
-    - git reset --hard HEAD
     - aspect format --task-key format-gl
 
 gazelle-task:
@@ -74,7 +70,6 @@ gazelle-task:
   script:
     - .aspect/bootstrap.sh
     - ASPECT_DEBUG=1 aspect gazelle --task-key gazelle-gl-debug
-    - git reset --hard HEAD
     - aspect gazelle --task-key gazelle-gl
 
 delivery-task:

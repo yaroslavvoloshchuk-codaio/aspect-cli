@@ -48,8 +48,9 @@ Usage:
     aspect gazelle --check
 """
 
+load("./lib/artifacts.axl", "artifact_name", "create_uploader", "detect_ci")
 load("./lib/runnable.axl", "runnable")
-load("./traits.axl", "BazelTrait")
+load("./traits.axl", "ArtifactsTrait", "BazelTrait")
 
 
 def _parse_diff_paths(diff_text):
@@ -81,6 +82,47 @@ def _parse_diff_paths(diff_text):
             continue
         paths[path] = True
     return sorted(paths.keys())
+
+
+def _try_upload_gazelle_diff(ctx, diff_text):
+    """Write gazelle's diff to a temp file and upload it via the
+    CI-specific artifact uploader. Failures are logged but don't fail
+    the task — the diff is informational, not load-bearing for the
+    verdict.
+
+    The download URL (when the CI provider returns one) lands in
+    `ArtifactsTrait.artifact_urls["gazelle_diff"]` so future
+    status-check features can surface a "View patch" link, mirroring
+    the format task's `format_diff` artifact.
+    """
+    out = ctx.std.io.stdout
+    ci = detect_ci(ctx.std.env)
+    uploader = create_uploader(ctx.std.env)
+    if not uploader:
+        out.write("--upload-gazelle-diff: not running on a recognized CI host; skipping.\n")
+        return
+
+    # Write the patch to a job-scoped tmpdir so concurrent gazelle
+    # runs in the same process don't collide.
+    tmp = ctx.std.env.temp_dir()
+    patch_path = tmp + "/gazelle-" + ctx.task.key + ".patch"
+    ctx.std.fs.write(patch_path, diff_text)
+
+    name = artifact_name(ci, ctx.task.name, ctx.task.key, "gazelle.patch")
+    result = uploader.upload_file(ctx, patch_path, name)
+    if not result["success"]:
+        out.write("--upload-gazelle-diff: upload failed: %s\n" % "; ".join(result.get("errors") or ["unknown error"]))
+        return
+
+    download_url = result.get("download_url") or ""
+    if download_url:
+        artifacts_trait = ctx.traits[ArtifactsTrait]
+        urls = dict(artifacts_trait.artifact_urls) if artifacts_trait.artifact_urls else {}
+        urls["gazelle_diff"] = download_url
+        artifacts_trait.artifact_urls = urls
+        out.write("--upload-gazelle-diff: uploaded patch — %s\n" % download_url)
+    else:
+        out.write("--upload-gazelle-diff: uploaded patch (no stable URL on this CI host).\n")
 
 
 # buildifier: disable=function-docstring
@@ -164,14 +206,31 @@ def _impl(ctx: TaskContext) -> int:
 
     affected = _parse_diff_paths(diff_stdout)
 
-    # Apply phase (default mode): re-run gazelle without the override
-    # so the wrapper's `-mode fix` takes effect and writes BUILDs.
-    # `--check` skips this — CI doesn't want a dirtied tree.
+    # Apply phase (default mode): apply the captured diff via
+    # `git apply -p0` rather than re-running gazelle. Skipping the
+    # second gazelle invocation is a meaningful win — gazelle scans
+    # the whole repo and on large workspaces that's slow even when
+    # cached. The diff we already have is exactly what fix-mode
+    # would produce, so `git apply` is equivalent.
+    #
+    # `-p0` is required: gazelle emits paths relative to the
+    # workspace root (e.g. `tools/gazelle/testdata/BUILD.bazel`) and
+    # the default `-p1` would strip the leading directory and look
+    # for `gazelle/testdata/BUILD.bazel`, which doesn't exist.
+    #
+    # `--check` skips this entirely — CI mode doesn't want a dirtied
+    # tree.
     if not ctx.args.check:
-        fix_status = r.spawn(gazelle, []).wait()
-        if not fix_status.success:
-            out.write("\x1b[0;31mERROR\x1b[0m: gazelle (apply) exited with code %d\n" % fix_status.code)
-            return fix_status.code
+        tmp = ctx.std.env.temp_dir()
+        patch_path = tmp + "/gazelle-" + ctx.task.key + ".patch"
+        ctx.std.fs.write(patch_path, diff_stdout)
+        apply_result = ctx.std.process.command("git").args(["apply", "-p0", patch_path]) \
+            .current_dir(ctx.std.env.root_dir()) \
+            .stdout("piped").stderr("piped").spawn().wait_with_output()
+        ctx.std.fs.remove_file(patch_path)
+        if not apply_result.status.success:
+            out.write("\x1b[0;31mERROR\x1b[0m: failed to apply gazelle's patch via `git apply` (exit %d).\nstderr: %s\nThe diff was generated but couldn't be applied — possibly the working tree changed during the run, or gazelle produced a diff format git doesn't accept. Run `bazel run %s` directly to apply.\n" % (apply_result.status.code, apply_result.stderr.strip(), ctx.args.gazelle_target))
+            return apply_result.status.code
 
     verb = "would update" if ctx.args.check else "updated"
     if affected:
@@ -185,21 +244,28 @@ def _impl(ctx: TaskContext) -> int:
         out.write("\nGazelle %s BUILD files (raw diff follows):\n" % verb)
         out.write(diff_stdout)
 
+    if ctx.args.upload_gazelle_diff:
+        _try_upload_gazelle_diff(ctx, diff_stdout)
+
     out.write("\x1b[0;31mERROR\x1b[0m: BUILD files are out of date. Run `aspect gazelle` locally and commit the result.\n")
     return 1
 
 
 gazelle = task(
     implementation = _impl,
-    traits = [BazelTrait],
+    traits = [ArtifactsTrait, BazelTrait],
     args = {
         "check": args.boolean(
             default = False,
             description = "When true, only report the diff — don't apply it. Recommended in CI: faster (skips the apply step), leaves the tree clean (no risk of a half-formatted state on mid-run interrupt), and the verdict comes from gazelle directly without depending on the workspace being a git working tree. Local devs typically leave this off so `aspect gazelle` updates BUILD files in place.",
         ),
+        "upload_gazelle_diff": args.boolean(
+            default = False,
+            description = "Upload gazelle's diff as a CI artifact (named `gazelle.patch`) so reviewers can apply it locally without re-running gazelle. No-op when the working tree is clean (no diff to upload), or when not running on a recognized CI host (GitHub Actions, Buildkite, CircleCI, GitLab). The download URL (where the CI provider returns one) is surfaced via ArtifactsTrait.artifact_urls['gazelle_diff']. Off by default.",
+        ),
         "gazelle_target": args.string(
             default = "//tools/gazelle:gazelle",
-            description = "Bazel label of the gazelle target. Generated by `aspect_gazelle()` from `@aspect_gazelle_prebuilt//:def.bzl`. The task invokes the same target twice in fix mode (once with `-mode=diff` to derive the verdict + patch without modifying the tree, then again in default fix-mode to apply the changes) and just once in `--check` mode (the diff invocation only).",
+            description = "Bazel label of the gazelle target. Generated by `aspect_gazelle()` from `@aspect_gazelle_prebuilt//:def.bzl`. The task runs the target once with `-mode=diff` to derive the verdict + patch without modifying the tree, then (in fix mode, when `--check=false`) applies the captured patch via `git apply -p0` rather than re-running gazelle.",
         ),
         "bazel_flag": args.string_list(
             description = "Additional Bazel flags forwarded to the gazelle build. Repeat the flag to pass multiple — e.g. `--bazel-flag=--config=ci --bazel-flag=--keep_going`.",

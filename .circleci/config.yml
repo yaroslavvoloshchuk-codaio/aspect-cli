@@ -79,6 +79,15 @@ jobs:
           name: Bootstrap
           command: .aspect/bootstrap.sh
       - run:
+          name: Format Task (ASPECT_DEBUG=1)
+          command: ASPECT_DEBUG=1 aspect format --task-key format-cci-debug
+      # Reset in-place formatter rewrites between runs so the non-debug
+      # invocation starts from the same pre-format state. format only
+      # modifies tracked files, so `reset --hard HEAD` is sufficient.
+      - run:
+          name: Reset working tree
+          command: git reset --hard HEAD
+      - run:
           name: Format Task
           command: aspect format --task-key format-cci
 
@@ -91,6 +100,12 @@ jobs:
       - run:
           name: Bootstrap
           command: .aspect/bootstrap.sh
+      - run:
+          name: Gazelle Task (ASPECT_DEBUG=1)
+          command: ASPECT_DEBUG=1 aspect gazelle --task-key gazelle-cci-debug
+      - run:
+          name: Reset working tree
+          command: git reset --hard HEAD
       - run:
           name: Gazelle Task
           command: aspect gazelle --task-key gazelle-cci

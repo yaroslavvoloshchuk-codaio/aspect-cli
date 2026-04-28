@@ -162,6 +162,14 @@ steps:
         - exit_status: 78 # unhealthy signal from .buildkite/hooks/pre-command
           limit: 1
     command: |
+      ASPECT_DEBUG=1 aspect format --task-key format-bk-debug
+      # Both runs need to start from the original tree. The debug run
+      # rewrites any unformatted files in place, so without a reset the
+      # second run would see a clean tree and exit 0 unconditionally —
+      # masking divergent behavior between debug and non-debug paths.
+      # `reset --hard HEAD` undoes only tracked-file modifications,
+      # which is all `aspect format` ever produces.
+      git reset --hard HEAD
       aspect format --task-key format-bk
 
   - key: gazelle-task
@@ -176,6 +184,9 @@ steps:
         - exit_status: 78 # unhealthy signal from .buildkite/hooks/pre-command
           limit: 1
     command: |
+      ASPECT_DEBUG=1 aspect gazelle --task-key gazelle-bk-debug
+      # See format-task above for the rationale behind the reset.
+      git reset --hard HEAD
       aspect gazelle --task-key gazelle-bk
 
   - key: build-task

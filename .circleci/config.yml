@@ -17,6 +17,10 @@ workflows:
           requires: [pre-build]
       - test-task:
           requires: [pre-build]
+      - format-task:
+          requires: [pre-build]
+      - gazelle-task:
+          requires: [pre-build]
       - delivery-task:
           requires: [pre-build]
 
@@ -64,6 +68,32 @@ jobs:
       - run:
           name: Test Task
           command: aspect test --task-key test-cci //...
+
+  format-task:
+    machine: true
+    resource_class: aspect-build/aspect-default
+    working_directory: /mnt/ephemeral/workdir
+    steps:
+      - checkout
+      - run:
+          name: Bootstrap
+          command: .aspect/bootstrap.sh
+      - run:
+          name: Format Task
+          command: aspect format --task-key format-cci
+
+  gazelle-task:
+    machine: true
+    resource_class: aspect-build/aspect-default
+    working_directory: /mnt/ephemeral/workdir
+    steps:
+      - checkout
+      - run:
+          name: Bootstrap
+          command: .aspect/bootstrap.sh
+      - run:
+          name: Gazelle Task
+          command: aspect gazelle --task-key gazelle-cci
 
   delivery-task:
     machine: true

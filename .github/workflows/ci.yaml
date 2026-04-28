@@ -72,6 +72,30 @@ jobs:
         working-directory: examples/lint
         run: aspect lint  --task-key lint-gha --aspect=//:linters.bzl%shellcheck //...
 
+  format-task:
+    runs-on: [self-hosted, aspect-workflows, aspect-default]
+    needs: [pre-build]
+    env:
+      ASPECT_API_TOKEN: ${{ secrets.ASPECT_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Bootstrap
+        run: .aspect/bootstrap.sh
+      - name: Format Task
+        run: aspect format --task-key format-gha
+
+  gazelle-task:
+    runs-on: [self-hosted, aspect-workflows, aspect-default]
+    needs: [pre-build]
+    env:
+      ASPECT_API_TOKEN: ${{ secrets.ASPECT_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Bootstrap
+        run: .aspect/bootstrap.sh
+      - name: Gazelle Task
+        run: aspect gazelle --task-key gazelle-gha
+
   delivery-task:
     runs-on: [self-hosted, aspect-workflows, aspect-default]
     needs: [pre-build]

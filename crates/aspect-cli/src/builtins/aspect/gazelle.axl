@@ -12,14 +12,20 @@ Why not git stash + git diff (the format task):
     separate `git ls-files --others` check
 
 Why not require a `with_check = True` sibling `.check` target:
-  - the standard gazelle wrapper hardcodes `-mode fix`, but Gazelle's
-    Go flag parsing treats `-mode=diff` passed after `--` as a
-    last-wins override — behavior switches to diff-mode (no tree
-    modification, diff on stdout) without rebuilding the binary.
-  - exit code is unreliable in that duplicate-flag config (it's 0
-    even when the diff is non-empty), so we drive the verdict off
-    stdout content instead. Robust and one fewer config knob for the
-    user.
+  - `with_check` is specific to `aspect_gazelle()` from
+    `aspect_gazelle_prebuilt`. Upstream `gazelle()` (the
+    `bazel-contrib/bazel-gazelle` macro that users adopt when
+    building gazelle from source) has no equivalent — it only
+    emits `<name>` and `<name>-runner.bash`. So requiring `.check`
+    would lock the task to the prebuilt module and break the
+    build-from-source path (which we exercise via the
+    `:gazelle_from_source` regression target).
+  - The aspect-gazelle-prebuilt wrapper hardcodes `-mode fix`,
+    but Gazelle's Go flag parsing treats `-mode=diff` passed after
+    `--` as a last-wins override — BEHAVIOR switches to diff-mode
+    (no tree modification, diff on stdout) without rebuilding the
+    binary. Same trick applies to upstream gazelle, so the same
+    task implementation works against either.
 
 Install:
     Add aspect_gazelle_prebuilt to MODULE.bazel:
@@ -40,8 +46,6 @@ Usage:
     aspect gazelle
     # CI mode: don't modify the tree, just report.
     aspect gazelle --check
-    # Soft-fail mode — print a WARNING but exit 0.
-    aspect gazelle --soft-fail
 """
 
 load("./lib/runnable.axl", "runnable")
@@ -181,11 +185,6 @@ def _impl(ctx: TaskContext) -> int:
         out.write("\nGazelle %s BUILD files (raw diff follows):\n" % verb)
         out.write(diff_stdout)
 
-    if ctx.args.soft_fail:
-        out.write("\x1b[0;33mWARNING\x1b[0m: BUILD files are out of date, but --soft-fail is set; task exits 0.\n")
-        out.write("Run `aspect gazelle` (or `bazel run %s`) locally and commit the result, or amend with --soft-fail=false to enforce.\n" % ctx.args.gazelle_target)
-        return 0
-
     out.write("\x1b[0;31mERROR\x1b[0m: BUILD files are out of date. Run `aspect gazelle` locally and commit the result.\n")
     return 1
 
@@ -197,10 +196,6 @@ gazelle = task(
         "check": args.boolean(
             default = False,
             description = "When true, only report the diff — don't apply it. Recommended in CI: faster (skips the apply step), leaves the tree clean (no risk of a half-formatted state on mid-run interrupt), and the verdict comes from gazelle directly without depending on the workspace being a git working tree. Local devs typically leave this off so `aspect gazelle` updates BUILD files in place.",
-        ),
-        "soft_fail": args.boolean(
-            default = False,
-            description = "When true, the task returns 0 even when BUILD files are out of date, printing a WARNING with the affected file list instead. Useful for teams introducing gazelle incrementally so the CI step doesn't block merges. Gazelle's own non-zero exits (configuration errors, missing language extensions, etc.) are still surfaced as task failures regardless of this flag.",
         ),
         "gazelle_target": args.string(
             default = "//tools/gazelle:gazelle",
